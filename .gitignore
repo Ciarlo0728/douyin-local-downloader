@@ -1,0 +1,12 @@
+.venv/
+data/
+downloads/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+.cookies.json
+config.yml
+.env
+service.log

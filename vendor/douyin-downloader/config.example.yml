@@ -1,0 +1,150 @@
+link:
+  - https://www.douyin.com/user/MS4wLjABAAAA6O7EZyfDRYXxJrUTpf91K3tmB4rBROkAw-nYMfld8ss
+
+path: ./Downloaded/
+
+# 是否下载视频文件；关闭后仍可按下方开关保存原始封面、音乐、头像或 JSON。
+# 默认只保存视频本体，其余附带产物按需打开。
+video: true
+music: false
+cover: false
+avatar: false
+json: false
+
+start_time: ""
+end_time: ""
+
+folderstyle: true
+
+# 文件/目录命名模板。可用变量：
+#   {id} {title} {author} {author_id} {date} {year} {month} {day}
+#   {time} {timestamp} {type} {mode}
+# 要求模板中至少包含 {id} 以避免重名覆盖。
+filename_template: "{date}_{title}_{id}"
+folder_template: "{date}_{title}_{id}"
+
+# 作者目录层命名方式。可选值：
+#   nickname     - 仅作者昵称（默认，最直观，但重名会合并、改名会分裂）
+#   sec_uid      - 作者 sec_uid（稳定唯一，但不直观）
+#   nickname_uid - 昵称_sec_uid（直观 + 唯一，推荐重度用户）
+# 切换只影响后续下载，不会迁移已存在的目录。
+author_dir: "nickname"
+
+# 默认不下载作者主页置顶作品；如需包含置顶，改为 true
+download_pinned: false
+
+# 下载博主作品时，在作者根目录覆盖保存主页地址文本
+author_url: false
+
+# 下载博主作品时，在作者根目录覆盖保存一张主页首屏截图
+homepage_screenshot: false
+
+mode:
+  - post
+
+number:
+  post: 1
+  like: 0
+  allmix: 0
+  mix: 0
+  music: 0
+  collect: 0
+  collectmix: 0
+
+# 增量任务的磁盘主文件缺失时是否重新下载：
+# true  保持当前行为，文件缺失或为空时重新下载；
+# false 数据库仍有有效下载记录时跳过（数据库不可用或记录已删除时仍会下载）。
+redownload_missing_files: true
+
+# 各模式是否启用增量下载：true 跳过已判定为下载过的作品；
+# false 重新下载并覆盖当前筛选范围内的作品。
+increase:
+  post: true
+  like: true
+  allmix: true
+  mix: true
+  music: true
+
+thread: 5
+retry_times: 3
+proxy: ""
+database: true
+database_path: dy_downloader.db
+
+# 视频下载画质。抖音 API 为每个视频返回多档码率，此选项决定选用哪一档：
+#   original                 - 原画：探测上传原片（转码档列表之外，可比最高
+#                              转码档大数倍），比转码档大则优先下载原片，探测
+#                              失败时退回最高转码档。代价是每条作品多一次探测
+#                              请求（超时 10s）
+#   highest                  - 最高转码档（默认）：只在 bit_rate 阶梯里挑，
+#                              不发探测请求
+#   lowest                   - 最低可用档（省流量）
+#   1440p / 1080p / 720p / 540p / 480p / 360p
+#                            - 指定分辨率，匹配不到时自动降级到最接近的可用档
+# 实际可用档位取决于原视频上传质量。
+video_quality: highest
+
+progress:
+  quiet_logs: true
+
+transcript:
+  enabled: false
+  model: gpt-4o-mini-transcribe
+  output_dir: ""
+  response_formats:
+    - txt
+    - json
+  api_url: https://api.openai.com/v1/audio/transcriptions
+  api_key_env: OPENAI_API_KEY
+  api_key: ""
+
+browser_fallback:
+  enabled: true
+  headless: false
+  max_scrolls: 240
+  idle_rounds: 8
+  wait_timeout_seconds: 600
+
+# 评论采集（可选）：启用后每个作品会额外生成 *_comments.json
+comments:
+  enabled: false
+  include_replies: false
+  max_comments: 0   # 0 = 不限
+  page_size: 20
+
+# 直播录制（可选）：当 link 指向 live.douyin.com/{room_id} 或 /follow/live/{room_id} 时生效
+live:
+  max_duration_seconds: 0   # 0 = 录到主播下播
+  chunk_size: 65536
+  idle_timeout_seconds: 30
+
+# 下载完成通知（可选）。providers 支持 bark / telegram / webhook
+notifications:
+  enabled: false
+  on_success: true
+  on_failure: true
+  providers: []
+  # 示例：
+  # providers:
+  #   - type: bark
+  #     url: https://api.day.app/YOUR_DEVICE_KEY
+  #     sound: bell
+  #   - type: telegram
+  #     bot_token: "123456:ABC..."
+  #     chat_id: "987654321"
+  #   - type: webhook
+  #     url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+  #     extra_body:
+  #       msgtype: text
+
+# REST API 服务模式（可选，需额外安装 fastapi + uvicorn）
+server:
+  max_jobs: 500
+  job_ttl_seconds: 86400   # 完成态 job 保留 24 小时
+
+cookies:
+  msToken: YOUR_MS_TOKEN
+  ttwid: YOUR_TTWID
+  odin_tt: YOUR_ODIN_TT
+  passport_csrf_token: YOUR_CSRF_TOKEN
+  sid_guard: YOUR_SID_GUARD

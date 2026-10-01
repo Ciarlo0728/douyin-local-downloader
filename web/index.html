@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="local-token" content="__LOCAL_TOKEN__">
+  <title>抖音本地下载器 · 作品库</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-icon">↓</span><span>抖音下载器<small>LOCAL LIBRARY</small></span></a>
+    <div class="nav-label">我的工作区</div>
+    <button class="nav active" id="library-nav"><span>▦</span> 作品选择 <span id="library-count" class="nav-count">0</span></button>
+    <button class="nav" id="queue-nav"><span>↓</span> 下载任务 <span id="queue-count" class="nav-count">0</span></button>
+    <div class="sidebar-bottom"><span class="live-dot"></span>本机运行 <small>文件与登录状态保存在本机</small><button class="text-button" id="shutdown">退出工具</button></div>
+  </aside>
+  <main>
+    <header><div><span class="eyebrow">你的素材，从这里开始</span><h1>发现作品，按需下载。</h1><p>粘贴抖音主页或视频链接，选好再下载。</p></div>
+      <button id="login" class="button secondary"><span class="status-dot" id="login-dot"></span><span id="login-label">登录抖音</span><span>↗</span></button>
+    </header>
+    <div id="auth-message" class="subtle auth-message"></div>
+    <section class="input-panel" aria-label="扫描链接">
+      <form id="scan-form">
+        <label for="url">主页或视频链接</label>
+        <div class="input-row"><span class="link-icon">↗</span><input id="url" placeholder="粘贴链接，也支持完整分享文字…" autocomplete="off" required>
+          <select id="scan-count" aria-label="本次扫描数量"><option value="50">最近 50 条</option><option value="100">最近 100 条</option><option value="200">最近 200 条</option></select>
+          <button class="button primary" id="scan-submit">扫描作品 <span>→</span></button></div>
+      </form>
+      <div class="input-footer"><span><span class="tiny-dot"></span>扫描只读取作品信息，勾选后才下载视频</span><button class="text-button" id="history-toggle">最近扫描 ▾</button></div>
+      <div id="history" hidden></div>
+    </section>
+    <section class="folder-bar"><span>保存到</span><input id="output" aria-label="下载保存路径"><button class="text-button" id="save-output">保存路径</button><button class="text-button" id="choose-folder">选择文件夹</button><button class="folder-open" id="open-folder" aria-label="打开下载文件夹">↗</button></section>
+    <section id="library-section">
+      <div class="section-heading"><div><h2 id="result-title">作品列表</h2><span id="result-count" class="subtle">扫描后，作品会出现在这里</span></div><div class="filters"><input id="keyword" aria-label="搜索已扫描作品" placeholder="搜索已扫描的标题…"><select id="download-filter" aria-label="下载状态筛选"><option value="all">全部作品</option><option value="new">未下载</option><option value="done">已下载</option></select></div></div>
+      <div id="scan-status" role="status" class="scan-status" hidden><span id="scan-status-text"></span><div><button id="stop-scan" class="text-button" hidden>停止扫描</button><button id="load-more" class="text-button" hidden>继续加载 50 条 →</button></div></div>
+      <div class="selection-toolbar" id="selection-toolbar" hidden><label><input type="checkbox" id="select-all"> 全选当前筛选结果</label><button class="text-button" id="clear-selection">清空选择</button></div>
+      <div class="empty-state" id="empty"><div class="empty-icon">▦</div><h3>先找到你想保存的作品</h3><p>输入作者主页，浏览并挑选视频；<br>输入单条链接，直接解析一个作品。</p></div>
+      <div class="video-grid" id="grid"></div>
+      <div class="selection-bar" id="selection-bar" hidden><div><strong id="selected-count">0</strong> 条视频已选择<small>优先保存最高可用画质 · 已有文件自动跳过</small></div><button class="button primary" id="download-selected">下载所选 <span>↓</span></button></div>
+    </section>
+    <section class="queue-section" id="queue-section"><div class="section-heading"><div><h2>下载任务</h2><span class="subtle" id="queue-summary">还没有下载任务</span></div></div><div id="jobs"></div></section>
+    <footer>只读取当前账号可访问的作品。分页受限会保留已发现结果，并明确提示。</footer>
+  </main>
+  <div class="toast" id="toast" role="alert" hidden></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

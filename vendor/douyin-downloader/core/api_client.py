@@ -1,0 +1,1863 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import random
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
+
+import aiohttp
+
+from auth import MsTokenManager
+from utils.cookie_utils import sanitize_cookies
+from utils.logger import safe_log_url, setup_logger
+from utils.xbogus import XBogus
+
+try:
+    from utils.abogus import ABogus, BrowserFingerprintGenerator
+except Exception:  # pragma: no cover - optional dependency
+    ABogus = None
+    BrowserFingerprintGenerator = None
+
+logger = setup_logger("APIClient")
+
+_LOGIN_REQUIRED_STATUS_CODES = {2483}
+
+# Douyin fronts the web API with an edge WAF that answers 403 (and 429)
+# once a caller trips a rate-based risk-control rule. Both are transient:
+# the block is served in tens of milliseconds without reaching the
+# backend, and the *same* cookies succeed again after a cooldown. A real
+# logout never looks like this — Douyin reports those as HTTP 200 with a
+# non-zero ``status_code`` (see ``_is_login_required``), so retrying a
+# 403 cannot mask an expired session.
+#
+# These reuse the ordinary retry schedule on purpose. A longer WAF-specific
+# backoff was tried and reverted: ``_request_json`` is the chokepoint for
+# every Douyin call, so stretching it to ~20s per request blew past the
+# renderer's 15s timeout on the my-content routes and turned per-item loops
+# (``user_downloader``'s detail recovery) into multi-hour stalls. Callers
+# that walk many pages degrade gracefully on an exhausted fetch instead.
+_RISK_CONTROL_HTTP_STATUSES = frozenset({403, 429})
+
+_HOMEPAGE_SCREENSHOT_BRIDGE_ENV = "DOUYIN_HOMEPAGE_SCREENSHOT_BRIDGE"
+_HOMEPAGE_SCREENSHOT_MESSAGE_PREFIX = "DOUYIN_HOMEPAGE_SCREENSHOT_REQUEST "
+_HOMEPAGE_PROFILE_READY_SCRIPT = r"""(expected) => {
+    const normalize = (value) => String(value ?? "")
+        .normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+    const readyKey = "__DOUYIN_HOMEPAGE_PROFILE_READY_STATE__";
+    const blockedKey = "__DOUYIN_HOMEPAGE_PROFILE_BLOCKED_REASON__";
+    const reset = () => {
+        delete window[readyKey];
+        return false;
+    };
+    if (document.readyState !== "complete" || !document.body) return reset();
+
+    const bodyText = normalize(document.body.innerText || document.body.textContent);
+    const blocked = ["验证码", "安全验证", "验证后继续", "页面不存在", "用户不存在",
+        "账号已注销"].find((marker) => bodyText.includes(normalize(marker)));
+    if (blocked) {
+        window[blockedKey] = blocked;
+        return reset();
+    }
+    delete window[blockedKey];
+
+    const visible = (element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" &&
+            style.opacity !== "0" && rect.width > 0 && rect.height > 0 &&
+            rect.bottom > 0 && rect.top < Math.max(window.innerHeight || 0, 900);
+    };
+    const numberToken = "(\\d+(?:[.,]\\d+)?(?:万|亿|w|k|m)?\\+?)";
+    const groups = [["关注"], ["粉丝"], ["获赞", "点赞"]];
+    const readStats = (text, direction) => groups.map((labels) => {
+        for (const label of labels) {
+            const normalizedLabel = normalize(label);
+            const pattern = direction === "before"
+                ? new RegExp(`${numberToken}${normalizedLabel}`)
+                : new RegExp(`${normalizedLabel}${numberToken}`);
+            const match = text.match(pattern);
+            if (match?.[1]) return match[1];
+        }
+        return "";
+    });
+    const expectedNickname = normalize(expected?.nickname);
+    const candidates = Array.from(
+        document.body.querySelectorAll("main, header, section, article, div")
+    ).filter(visible).map((element) => {
+        const text = normalize(element.innerText || element.textContent);
+        if (!text || text.length > 1500) return null;
+        const before = readStats(text, "before");
+        const after = readStats(text, "after");
+        const beforeCount = before.filter(Boolean).length;
+        const afterCount = after.filter(Boolean).length;
+        const values = afterCount >= beforeCount ? after : before;
+        if (!values[1] || Math.max(beforeCount, afterCount) < 2) return null;
+        if (expectedNickname && !text.includes(expectedNickname)) return null;
+        return {element, text, values};
+    }).filter(Boolean).sort((left, right) => left.text.length - right.text.length);
+    const profile = candidates[0];
+    if (!profile) return reset();
+    const images = Array.from(document.images).filter(visible);
+    if (images.some((image) => !image.complete)) return reset();
+    if (document.fonts && document.fonts.status !== "loaded") return reset();
+
+    const loaded = images.filter((image) => image.naturalWidth > 0).length;
+    const signature = profile.values.concat(String(loaded)).join("|");
+    const previous = window[readyKey];
+    const count = previous?.signature === signature ? previous.count + 1 : 1;
+    window[readyKey] = {signature, count};
+    return count >= 3;
+}"""
+_HOMEPAGE_PROFILE_BLOCKED_SCRIPT = (
+    "() => String(window.__DOUYIN_HOMEPAGE_PROFILE_BLOCKED_REASON__ || '')"
+)
+# 就绪判定要等到懒加载的作品网格铺完，冷缓存下 20 秒常常不够。
+_HOMEPAGE_PROFILE_READY_TIMEOUT_MS = 45_000
+
+
+class LoginRequiredError(Exception):
+    """Raised when Douyin rejects a request because the session is not logged in.
+
+    Signalled by ``status_code == 2483`` (or a ``status_msg`` asking to log in).
+    Higher layers (CLI) catch this to trigger an interactive re-login + retry.
+    """
+
+    def __init__(self, status_code: int, status_msg: str, path: str):
+        self.status_code = status_code
+        self.status_msg = status_msg
+        self.path = path
+        super().__init__(f"login required (status_code={status_code}) at {path}: {status_msg}")
+
+
+def _is_login_required(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    code = data.get("status_code")
+    msg = str(data.get("status_msg") or "")
+    # Match by message, not by the bare status_code=8: `8` is a generic
+    # Douyin error code, but "用户未登录" is unambiguously "not logged in"
+    # (returned by /profile/self/ and other endpoints on an expired
+    # session). Message-matching avoids misreading an unrelated code-8.
+    return code in _LOGIN_REQUIRED_STATUS_CODES or "请先登录" in msg or "用户未登录" in msg
+
+
+def _summarize_api_response(data: object) -> Dict[str, Any]:
+    """Keep response-shape diagnostics without persisting item payloads."""
+
+    raw = data if isinstance(data, dict) else {}
+    item_key = "-"
+    item_count = 0
+    for key in ("aweme_list", "items", "followings", "mix_list", "music_list", "data"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            item_key = key
+            item_count = len(value)
+            break
+
+    status_msg = " ".join(str(raw.get("status_msg") or "").split())[:200]
+    cursor = raw.get("max_cursor")
+    if cursor is None:
+        cursor = raw.get("cursor")
+    return {
+        "api_status": raw.get("status_code"),
+        "status_msg": status_msg,
+        "item_key": item_key,
+        "item_count": item_count,
+        "has_more": raw.get("has_more"),
+        "cursor": cursor,
+        "login_tip": bool((raw.get("not_login_module") or {}).get("guide_login_tip_exist"))
+        if isinstance(raw.get("not_login_module"), dict)
+        else False,
+        "verify_page": bool(raw.get("verify_ticket")),
+        "top_level_keys": ",".join(sorted(str(key) for key in raw)[:30]),
+    }
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))
+
+
+def _safe_error_text(exc: Exception) -> str:
+    text = " ".join(str(exc).split())
+    text = re.sub(r"(https?://[^?\s]+)\?\S+", r"\1?[redacted-query]", text)
+    return text[:500]
+
+
+def _log_api_response(
+    path: str,
+    attempt: int,
+    max_retries: int,
+    body: bytes,
+    data: object,
+    started: float,
+) -> None:
+    summary = _summarize_api_response(data)
+    logger.info(
+        "Douyin API response: path=%s attempt=%d/%d http=200 duration_ms=%d bytes=%d "
+        "api_status=%s status_msg=%r item_key=%s item_count=%s has_more=%s cursor=%s "
+        "login_tip=%s verify_page=%s keys=%s",
+        path,
+        attempt + 1,
+        max_retries,
+        _elapsed_ms(started),
+        len(body),
+        summary["api_status"],
+        summary["status_msg"],
+        summary["item_key"],
+        summary["item_count"],
+        summary["has_more"],
+        summary["cursor"],
+        summary["login_tip"],
+        summary["verify_page"],
+        summary["top_level_keys"],
+    )
+
+
+_USER_AGENT_POOL = [
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    ),
+]
+
+
+class DouyinAPIClient:
+    BASE_URL = "https://www.douyin.com"
+    LIVE_WEB_BASE_URL = "https://live.douyin.com"
+    LIVE_REFLOW_BASE_URL = "https://webcast.amemv.com"
+    _BROWSER_COOKIE_BLOCKLIST = {
+        "sessionid",
+        "sessionid_ss",
+        "sid_tt",
+        "sid_guard",
+        "uid_tt",
+        "uid_tt_ss",
+        "passport_auth_status",
+        "passport_auth_status_ss",
+        "passport_assist_user",
+        "passport_auth_mix_state",
+        "passport_mfa_token",
+        "login_time",
+    }
+
+    def __init__(
+        self,
+        cookies: Dict[str, str],
+        proxy: Optional[str] = None,
+        page_bridge: Optional[Any] = None,
+    ):
+        self.cookies = sanitize_cookies(cookies or {})
+        self.proxy = str(proxy or "").strip()
+        # 桌面版注入的页面签名通道(core/page_bridge.py,desktop-only)。为 None 时
+        # 所有端点走 aiohttp——CLI 姊妹仓永远是 None。鸭子类型:只要求
+        # ``await fetch(path, params, method=, data=)`` 返回带 http_status/body/text
+        # 的对象,失败异常带 ``page_bridge_code``。
+        self.page_bridge = page_bridge
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._browser_post_aweme_items: Dict[str, Dict[str, Any]] = {}
+        self._browser_post_stats: Dict[str, int] = {}
+        selected_ua = random.choice(_USER_AGENT_POOL)
+        self.headers = {
+            "User-Agent": selected_ua,
+            "Referer": "https://www.douyin.com/?recommend=1",
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate",
+            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        self._signer = XBogus(self.headers["User-Agent"])
+        self._ms_token_manager = MsTokenManager(user_agent=self.headers["User-Agent"])
+        self._ms_token = (self.cookies.get("msToken") or "").strip()
+        self._abogus_enabled = ABogus is not None and BrowserFingerprintGenerator is not None
+
+    async def __aenter__(self) -> "DouyinAPIClient":
+        await self._ensure_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+
+    async def _ensure_session(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers=self.headers,
+                cookies=self.cookies,
+                timeout=aiohttp.ClientTimeout(total=30),
+                raise_for_status=False,
+            )
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def get_session(self) -> aiohttp.ClientSession:
+        await self._ensure_session()
+        if self._session is None:
+            raise RuntimeError("Failed to create aiohttp session")
+        return self._session
+
+    async def _ensure_ms_token(self) -> str:
+        if self._ms_token:
+            return self._ms_token
+
+        token = await asyncio.to_thread(
+            self._ms_token_manager.ensure_ms_token,
+            self.cookies,
+        )
+        self._ms_token = token.strip()
+        if self._ms_token:
+            self.cookies["msToken"] = self._ms_token
+            if self._session and not self._session.closed:
+                self._session.cookie_jar.update_cookies({"msToken": self._ms_token})
+        return self._ms_token
+
+    async def _default_query(self) -> Dict[str, Any]:
+        ms_token = await self._ensure_ms_token()
+        return {
+            "device_platform": "webapp",
+            "aid": "6383",
+            "channel": "channel_pc_web",
+            "update_version_code": "170400",
+            "pc_client_type": "1",
+            "pc_libra_divert": "Windows",
+            "version_code": "290100",
+            "version_name": "29.1.0",
+            "cookie_enabled": "true",
+            "screen_width": "1536",
+            "screen_height": "864",
+            "browser_language": "zh-CN",
+            "browser_platform": "Win32",
+            "browser_name": "Chrome",
+            "browser_version": "139.0.0.0",
+            "browser_online": "true",
+            "engine_name": "Blink",
+            "engine_version": "139.0.0.0",
+            "os_name": "Windows",
+            "os_version": "10",
+            "cpu_core_num": "16",
+            "device_memory": "8",
+            "platform": "PC",
+            "downlink": "10",
+            "effective_type": "4g",
+            "round_trip_time": "200",
+            "support_h265": "1",
+            "support_dash": "1",
+            "uifid": "",
+            "msToken": ms_token,
+        }
+
+    def sign_url(self, url: str) -> Tuple[str, str]:
+        signed_url, _xbogus, ua = self._signer.build(url)
+        return signed_url, ua
+
+    def build_signed_path(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        base_url: Optional[str] = None,
+        request_data: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str]:
+        query = urlencode(params)
+        endpoint = f"{(base_url or self.BASE_URL).rstrip('/')}{path}"
+        ab_signed = self._build_abogus_url(endpoint, query, request_data=request_data)
+        if ab_signed:
+            return ab_signed
+        return self.sign_url(f"{endpoint}?{query}")
+
+    def _build_abogus_url(
+        self,
+        base_url: str,
+        query: str,
+        *,
+        request_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Tuple[str, str]]:
+        if not self._abogus_enabled:
+            return None
+
+        try:
+            browser_fp = BrowserFingerprintGenerator.generate_fingerprint("Chrome")
+            signer = ABogus(fp=browser_fp, user_agent=self.headers["User-Agent"])
+            body = urlencode(request_data or {})
+            params_with_ab, _ab, ua, _body = signer.generate_abogus(query, body)
+            return f"{base_url}?{params_with_ab}", ua
+        except Exception as exc:
+            logger.warning("Failed to generate a_bogus, fallback to X-Bogus: %s", exc)
+            return None
+
+    async def _request_json(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        suppress_error: bool = False,
+        max_retries: int = 3,
+        base_url: Optional[str] = None,
+        request_headers: Optional[Dict[str, str]] = None,
+        method: str = "GET",
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        await self._ensure_session()
+        method = method.upper()
+        if method not in {"GET", "POST"}:
+            raise ValueError(f"unsupported request method: {method}")
+        delays = [1, 2, 5]
+        last_exc: Optional[Exception] = None
+        risk_control_hit = False
+
+        for attempt in range(max_retries):
+            started = time.monotonic()
+            risk_control_hit = False
+            signing_kwargs: Dict[str, Any] = {}
+            if base_url:
+                signing_kwargs["base_url"] = base_url
+            if method == "POST":
+                signing_kwargs["request_data"] = data
+            signed_url, ua = self.build_signed_path(path, params, **signing_kwargs)
+            signer = "a_bogus" if "a_bogus=" in signed_url else "x_bogus"
+            logger.info(
+                "Douyin API request: path=%s method=%s attempt=%d/%d signer=%s "
+                "proxy_enabled=%s base=%s param_keys=%s",
+                path,
+                method,
+                attempt + 1,
+                max_retries,
+                signer,
+                bool(self.proxy),
+                "custom" if base_url else "default",
+                ",".join(sorted(str(key) for key in params)),
+            )
+            headers = {**self.headers, **(request_headers or {}), "User-Agent": ua}
+            request = self._session.post if method == "POST" else self._session.get
+            request_kwargs: Dict[str, Any] = {
+                "headers": headers,
+                "proxy": self.proxy or None,
+            }
+            if method == "POST":
+                request_kwargs["data"] = data or {}
+            try:
+                async with request(signed_url, **request_kwargs) as response:
+                    if response.status == 200:
+                        body = await response.read()
+                        if not body:
+                            # Empty 200 response is a common anti-bot signal
+                            # from Douyin. Retry with a fresh signature.
+                            retry_status = (
+                                "will retry" if attempt < max_retries - 1 else "no retries remain"
+                            )
+                            logger.warning(
+                                "Empty 200 response for %s (attempt %d/%d, duration_ms=%d), "
+                                "likely anti-bot; %s",
+                                path,
+                                attempt + 1,
+                                max_retries,
+                                _elapsed_ms(started),
+                                retry_status,
+                            )
+                            last_exc = RuntimeError(f"Empty 200 response for {path} (anti-bot)")
+                            if attempt < max_retries - 1:
+                                delay = delays[min(attempt, len(delays) - 1)]
+                                await asyncio.sleep(delay)
+                            continue
+                        try:
+                            data = await response.json(content_type=None)
+                        except Exception:
+                            import json as _json
+
+                            try:
+                                data = _json.loads(body)
+                            except Exception:
+                                logger.warning(
+                                    "Non-JSON 200 response for %s, length=%d duration_ms=%d",
+                                    path,
+                                    len(body),
+                                    _elapsed_ms(started),
+                                )
+                                return {}
+                        result = data if isinstance(data, dict) else {}
+                        _log_api_response(path, attempt, max_retries, body, result, started)
+                        if _is_login_required(result):
+                            raise LoginRequiredError(
+                                int(result.get("status_code") or 0),
+                                str(result.get("status_msg") or ""),
+                                path,
+                            )
+                        return result
+                    risk_control_hit = response.status in _RISK_CONTROL_HTTP_STATUSES
+                    if response.status < 500 and not risk_control_hit:
+                        log_fn = logger.info if suppress_error else logger.error
+                        log_fn(
+                            "Douyin API HTTP failure: path=%s attempt=%d/%d status=%s "
+                            "duration_ms=%d suppress_error=%s",
+                            path,
+                            attempt + 1,
+                            max_retries,
+                            response.status,
+                            _elapsed_ms(started),
+                            suppress_error,
+                        )
+                        return {}
+                    last_exc = RuntimeError(f"HTTP {response.status} for {path}")
+                    logger.warning(
+                        "Douyin API retryable HTTP failure: path=%s attempt=%d/%d status=%s "
+                        "duration_ms=%d risk_control=%s",
+                        path,
+                        attempt + 1,
+                        max_retries,
+                        response.status,
+                        _elapsed_ms(started),
+                        risk_control_hit,
+                    )
+            except LoginRequiredError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Douyin API attempt failed: path=%s attempt=%d/%d duration_ms=%d "
+                    "error_type=%s error=%s",
+                    path,
+                    attempt + 1,
+                    max_retries,
+                    _elapsed_ms(started),
+                    type(exc).__name__,
+                    _safe_error_text(exc),
+                )
+
+            if attempt < max_retries - 1:
+                delay = delays[min(attempt, len(delays) - 1)]
+                logger.info(
+                    "Douyin API retry scheduled: path=%s completed_attempt=%d/%d "
+                    "delay_s=%d risk_control=%s",
+                    path,
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    risk_control_hit,
+                )
+                await asyncio.sleep(delay)
+
+        log_fn = logger.info if suppress_error else logger.error
+        log_fn(
+            "Douyin API request exhausted: path=%s attempts=%d suppress_error=%s "
+            "error_type=%s error=%s",
+            path,
+            max_retries,
+            suppress_error,
+            type(last_exc).__name__ if last_exc else "-",
+            _safe_error_text(last_exc) if last_exc else "-",
+        )
+        return {}
+
+    def _payload_from_bridge_result(self, result: Any, path: str, started: float) -> Dict[str, Any]:
+        """把 bridge 200 响应折算成与 ``_request_json`` 一致的 payload。
+
+        body 非 dict(如反爬 HTML challenge 页)按 Non-JSON 200 记警告并降级为
+        ``{}``,与 aiohttp 路径的同名日志对齐,避免把它悄悄记成成功响应。
+        """
+        text = str(getattr(result, "text", "") or "")
+        body = getattr(result, "body", None)
+        if not isinstance(body, dict):
+            logger.warning(
+                "Non-JSON 200 response via page bridge: path=%s text_len=%d",
+                path,
+                len(text),
+            )
+        payload = body if isinstance(body, dict) else {}
+        _log_api_response(path, 0, 1, text.encode("utf-8", "replace"), payload, started)
+        if _is_login_required(payload):
+            raise LoginRequiredError(
+                int(payload.get("status_code") or 0),
+                str(payload.get("status_msg") or ""),
+                path,
+            )
+        return payload
+
+    async def _request_json_gated(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        method: str = "GET",
+        data: Optional[Dict[str, Any]] = None,
+        request_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """被 ArgusSecurityPlugin 门禁的端点入口。
+
+        有 ``page_bridge`` 时交给 Electron 隐藏登录窗口发(页面 SDK 补
+        uifid / timestamp / x-secsdk-web-signature),否则与 ``_request_json``
+        完全一致。经 bridge 的 403/429 不重试:Argus 拒绝是确定性的,重试只会
+        加速触发验证码。
+        """
+        if self.page_bridge is None:
+            return await self._request_json(
+                path, params, method=method, data=data, request_headers=request_headers
+            )
+        started = time.monotonic()
+        logger.info(
+            "Douyin API request via page bridge: path=%s method=%s param_keys=%s",
+            path,
+            method.upper(),
+            ",".join(sorted(str(key) for key in params)),
+        )
+        try:
+            result = await self.page_bridge.fetch(path, params, method=method.upper(), data=data)
+        except Exception as exc:
+            if getattr(exc, "page_bridge_code", None) == "NOT_LOGGED_IN":
+                raise LoginRequiredError(0, "page bridge: not logged in", path) from exc
+            raise
+        status = int(getattr(result, "http_status", 0) or 0)
+        if status == 200:
+            return self._payload_from_bridge_result(result, path, started)
+        logger.error(
+            "Douyin API HTTP failure via page bridge: path=%s status=%s duration_ms=%d body=%r",
+            path,
+            status,
+            _elapsed_ms(started),
+            str(getattr(result, "text", "") or "")[:80],
+        )
+        return {}
+
+    @staticmethod
+    def _normalize_paged_response(
+        raw_data: Any,
+        *,
+        item_keys: Optional[List[str]] = None,
+        source: str = "api",
+    ) -> Dict[str, Any]:
+        raw = raw_data if isinstance(raw_data, dict) else {}
+        keys = item_keys or []
+        keys = ["items", *keys, "aweme_list", "mix_list", "music_list"]
+
+        items: List[Dict[str, Any]] = []
+        for key in keys:
+            value = raw.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+
+        has_more_value = raw.get("has_more", False)
+        try:
+            has_more = bool(int(has_more_value))
+        except (TypeError, ValueError):
+            has_more = bool(has_more_value)
+
+        max_cursor_value = raw.get("max_cursor")
+        if max_cursor_value is None:
+            max_cursor_value = raw.get("cursor", 0)
+        try:
+            max_cursor = int(max_cursor_value or 0)
+        except (TypeError, ValueError):
+            max_cursor = 0
+
+        status_code_value = raw.get("status_code", 0)
+        try:
+            status_code = int(status_code_value or 0)
+        except (TypeError, ValueError):
+            status_code = 0
+
+        risk_flags = {
+            "login_tip": bool(
+                ((raw.get("not_login_module") or {}).get("guide_login_tip_exist"))
+                if isinstance(raw.get("not_login_module"), dict)
+                else False
+            ),
+            "verify_page": bool(raw.get("verify_ticket")),
+        }
+
+        normalized = {
+            "items": items,
+            "aweme_list": items,  # 兼容旧调用方
+            "has_more": has_more,
+            "max_cursor": max_cursor,
+            "status_code": status_code,
+            "source": source,
+            "risk_flags": risk_flags,
+            "raw": raw,
+        }
+        for key, value in raw.items():
+            if key not in normalized:
+                normalized[key] = value
+        return normalized
+
+    async def _build_user_page_params(
+        self, sec_uid: str, max_cursor: int, count: int
+    ) -> Dict[str, Any]:
+        params = await self._default_query()
+        params.update(
+            {
+                "sec_user_id": sec_uid,
+                "max_cursor": max_cursor,
+                "count": count,
+                "locate_query": "false",
+            }
+        )
+        return params
+
+    # aid=1128 works for videos but filters out image/note content;
+    # aid=6383 works for notes/gallery but may miss some video content.
+    _DETAIL_AID_CANDIDATES = ("6383", "1128")
+
+    async def get_video_detail(
+        self, aweme_id: str, *, suppress_error: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        for aid in self._DETAIL_AID_CANDIDATES:
+            params = await self._default_query()
+            params.update(
+                {
+                    "aweme_id": aweme_id,
+                    "aid": aid,
+                }
+            )
+
+            data = await self._request_json(
+                "/aweme/v1/web/aweme/detail/",
+                params,
+                suppress_error=(suppress_error or aid != self._DETAIL_AID_CANDIDATES[-1]),
+            )
+            if not data:
+                continue
+
+            detail = data.get("aweme_detail")
+            if detail:
+                return detail
+
+            # API returned data but aweme_detail is null — check if content was
+            # filtered (e.g. filter_reason="images_base" for note/gallery).
+            filter_info = data.get("filter_detail")
+            if isinstance(filter_info, dict) and filter_info.get("filter_reason"):
+                logger.info(
+                    "Aweme %s filtered with aid=%s (reason=%s), retrying",
+                    aweme_id,
+                    aid,
+                    filter_info["filter_reason"],
+                )
+                continue
+
+            # aweme_detail is null without a filter reason — no retry needed
+            break
+
+        return None
+
+    async def get_user_post(
+        self, sec_uid: str, max_cursor: int = 0, count: int = 18
+    ) -> Dict[str, Any]:
+        params = await self._build_user_page_params(sec_uid, max_cursor, count)
+        params.update(
+            {
+                "show_live_replay_strategy": "1",
+                "need_time_list": "1",
+                "time_list_query": "0",
+                "whale_cut_token": "",
+                "cut_version": "1",
+                "publish_video_strategy_type": "2",
+            }
+        )
+        raw = await self._request_json("/aweme/v1/web/aweme/post/", params)
+        return self._normalize_paged_response(raw, item_keys=["aweme_list"])
+
+    async def get_user_like(
+        self, sec_uid: str, max_cursor: int = 0, count: int = 20
+    ) -> Dict[str, Any]:
+        params = await self._build_user_page_params(sec_uid, max_cursor, count)
+        raw = await self._request_json_gated("/aweme/v1/web/aweme/favorite/", params)
+        return self._normalize_paged_response(raw, item_keys=["aweme_list"])
+
+    async def get_user_mix(
+        self, sec_uid: str, max_cursor: int = 0, count: int = 20
+    ) -> Dict[str, Any]:
+        params = await self._build_user_page_params(sec_uid, max_cursor, count)
+        raw = await self._request_json("/aweme/v1/web/mix/list/", params)
+        return self._normalize_paged_response(raw, item_keys=["mix_infos", "mix_list"])
+
+    async def get_user_music(
+        self, sec_uid: str, max_cursor: int = 0, count: int = 20
+    ) -> Dict[str, Any]:
+        params = await self._build_user_page_params(sec_uid, max_cursor, count)
+        raw = await self._request_json("/aweme/v1/web/music/list/", params)
+        return self._normalize_paged_response(raw, item_keys=["music_list"])
+
+    async def get_following_page(
+        self,
+        sec_uid: str,
+        *,
+        max_time: int = 0,
+        count: int = 20,
+    ) -> Dict[str, Any]:
+        """Fetch a single page of the logged-in account's following list.
+
+        Desktop-only: used by ``core/following.FollowingService`` to sync the
+        "My Following" tab. Douyin's web endpoint paginates via time-based
+        cursoring: the response contains ``min_time`` which must be passed as
+        ``max_time`` in the next request to get the next page. The ``count``
+        parameter is capped at 20 by the server regardless of what we send.
+
+        Returns a normalized dict with ``items``, ``has_more``, ``min_time``,
+        ``max_time``, ``status_code``, and ``raw`` (the full response).
+        """
+        params = await self._default_query()
+        params.update(
+            {
+                "user_id": sec_uid,
+                "sec_user_id": sec_uid,
+                "offset": 0,
+                "count": count,
+                "source_type": "1",
+                "gps_access": "0",
+                "address_book_access": "0",
+                "min_change": "0",
+            }
+        )
+        if max_time > 0:
+            params["max_time"] = max_time
+        raw = await self._request_json("/aweme/v1/web/user/following/list/", params)
+        normalized = self._normalize_paged_response(
+            raw,
+            item_keys=["followings", "follow_list", "user_list"],
+        )
+        # Expose the time-based pagination fields for the sync loop.
+        normalized["min_time"] = int(raw.get("min_time") or 0) if isinstance(raw, dict) else 0
+        normalized["max_time_resp"] = int(raw.get("max_time") or 0) if isinstance(raw, dict) else 0
+        return normalized
+
+    async def _build_collect_page_params(self, max_cursor: int, count: int) -> Dict[str, Any]:
+        params = await self._default_query()
+        params.update(
+            {
+                "cursor": max_cursor,
+                "count": count,
+                "version_code": "170400",
+                "version_name": "17.4.0",
+            }
+        )
+        return params
+
+    async def get_user_collection(
+        self, sec_uid: str = "self", max_cursor: int = 0, count: int = 20
+    ) -> Dict[str, Any]:
+        """Fetch one page of the logged-in account's collected awemes.
+
+        This is the account-level/default collection feed. It is distinct
+        from ``get_user_collects`` (custom folder metadata) and from
+        ``get_user_like`` (liked awemes). Douyin currently exposes it as a
+        form-encoded POST whose cursor lives in the request body.
+        """
+        if sec_uid and sec_uid != "self":
+            logger.warning("Account collection currently requires self sec_uid, got=%s", sec_uid)
+            return self._normalize_paged_response({}, item_keys=["aweme_list"], source="api")
+
+        params = await self._default_query()
+        params.update(
+            {
+                "publish_video_strategy_type": "2",
+                "version_code": "170400",
+                "version_name": "17.4.0",
+            }
+        )
+        raw = await self._request_json_gated(
+            "/aweme/v1/web/aweme/listcollection/",
+            params,
+            method="POST",
+            data={"count": count, "cursor": max_cursor},
+            request_headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://www.douyin.com/user/self?showTab=favorite_collection",
+            },
+        )
+        return self._normalize_paged_response(raw, item_keys=["aweme_list"])
+
+    async def get_user_collects(
+        self, sec_uid: str, max_cursor: int = 0, count: int = 10
+    ) -> Dict[str, Any]:
+        if sec_uid and sec_uid != "self":
+            logger.warning("Collect folders currently require self sec_uid, got=%s", sec_uid)
+            return self._normalize_paged_response({}, item_keys=["collects_list"], source="api")
+
+        params = await self._build_collect_page_params(max_cursor, count)
+        raw = await self._request_json_gated("/aweme/v1/web/collects/list/", params)
+        return self._normalize_paged_response(raw, item_keys=["collects_list"])
+
+    async def get_collect_aweme(
+        self, collects_id: str, max_cursor: int = 0, count: int = 10
+    ) -> Dict[str, Any]:
+        params = await self._build_collect_page_params(max_cursor, count)
+        params.update({"collects_id": collects_id})
+        raw = await self._request_json_gated("/aweme/v1/web/collects/video/list/", params)
+        return self._normalize_paged_response(raw, item_keys=["aweme_list"])
+
+    async def get_user_collect_mix(
+        self, sec_uid: str, max_cursor: int = 0, count: int = 12
+    ) -> Dict[str, Any]:
+        if sec_uid and sec_uid != "self":
+            logger.warning("Collect mix currently require self sec_uid, got=%s", sec_uid)
+            return self._normalize_paged_response({}, item_keys=["mix_infos"], source="api")
+
+        params = await self._build_collect_page_params(max_cursor, count)
+        raw = await self._request_json_gated("/aweme/v1/web/mix/listcollection/", params)
+        return self._normalize_paged_response(raw, item_keys=["mix_infos"])
+
+    async def get_user_info(self, sec_uid: str) -> Optional[Dict[str, Any]]:
+        params = await self._default_query()
+        params.update({"sec_user_id": sec_uid})
+
+        data = await self._request_json("/aweme/v1/web/user/profile/other/", params)
+        if data:
+            return data.get("user")
+        return None
+
+    async def get_self_info(self) -> Optional[Dict[str, Any]]:
+        """Fetch the logged-in user's own profile.
+
+        Uses the ``/aweme/v1/web/user/profile/self/`` endpoint which
+        identifies the user from the session cookies — no ``sec_uid``
+        parameter needed. Returns the ``user`` dict (containing
+        ``sec_uid``, ``uid``, ``nickname``, etc.) or ``None`` on failure.
+
+        Desktop-only: used by the Following sync to resolve the
+        logged-in user's ``sec_uid`` before calling
+        ``get_following_page``.
+        """
+        params = await self._default_query()
+        data = await self._request_json("/aweme/v1/web/user/profile/self/", params)
+        if data:
+            return data.get("user")
+        return None
+
+    async def get_mix_detail(self, mix_id: str) -> Optional[Dict[str, Any]]:
+        params = await self._default_query()
+        params.update({"mix_id": mix_id})
+        data = await self._request_json("/aweme/v1/web/mix/detail/", params)
+        if not data:
+            return None
+        return data.get("mix_info") or data.get("mix_detail") or data
+
+    async def get_mix_aweme(self, mix_id: str, cursor: int = 0, count: int = 20) -> Dict[str, Any]:
+        params = await self._default_query()
+        params.update({"mix_id": mix_id, "cursor": cursor, "count": count})
+        raw = await self._request_json("/aweme/v1/web/mix/aweme/", params)
+        return self._normalize_paged_response(raw, item_keys=["aweme_list"])
+
+    async def get_music_detail(self, music_id: str) -> Optional[Dict[str, Any]]:
+        params = await self._default_query()
+        params.update({"music_id": music_id})
+        data = await self._request_json("/aweme/v1/web/music/detail/", params)
+        if not data:
+            return None
+        return data.get("music_info") or data.get("music_detail") or data
+
+    async def get_music_aweme(
+        self, music_id: str, cursor: int = 0, count: int = 20
+    ) -> Dict[str, Any]:
+        params = await self._default_query()
+        params.update({"music_id": music_id, "cursor": cursor, "count": count})
+        raw = await self._request_json("/aweme/v1/web/music/aweme/", params)
+        return self._normalize_paged_response(raw, item_keys=["aweme_list"])
+
+    async def _build_live_room_request(
+        self, room_id: str, sec_user_id: str, room_id_kind: str
+    ) -> Tuple[str, Dict[str, Any], str]:
+        params = await self._default_query()
+        if room_id_kind == "room_id":
+            params.update(
+                {
+                    "room_id": room_id,
+                    "sec_user_id": sec_user_id,
+                    "type_id": "0",
+                    "live_id": "1",
+                    "app_id": "1128",
+                    "version_code": "99.99.99",
+                }
+            )
+            return "/webcast/room/reflow/info/", params, self.LIVE_REFLOW_BASE_URL
+
+        params.update(
+            {
+                "web_rid": room_id,
+                "app_name": "douyin_web",
+                "live_id": "1",
+                "device_platform": "web",
+                "language": "zh-CN",
+                "enter_source": "",
+                "is_need_double_stream": "false",
+                "cookie_enabled": "true",
+            }
+        )
+        return "/webcast/room/web/enter/", params, self.LIVE_WEB_BASE_URL
+
+    @staticmethod
+    def _normalize_live_room_response(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+        if not isinstance(data, dict):
+            return None
+
+        room = data.get("room") if isinstance(data.get("room"), dict) else None
+        room_list = data.get("data")
+        if room is None and isinstance(room_list, list) and room_list:
+            room = room_list[0] if isinstance(room_list[0], dict) else None
+        if room is None and isinstance(raw.get("room"), dict):
+            room = raw.get("room")
+        if not isinstance(room, dict):
+            return None
+
+        user = data.get("user") if isinstance(data.get("user"), dict) else room.get("owner")
+        return {"room": room, "user": user if isinstance(user, dict) else {}, "raw": raw}
+
+    @staticmethod
+    def _find_stream_room(value: Any) -> Optional[Dict[str, Any]]:
+        pending = [value]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, dict):
+                if isinstance(current.get("stream_url"), dict):
+                    return current
+                pending.extend(current.values())
+            elif isinstance(current, list):
+                pending.extend(current)
+        return None
+
+    @staticmethod
+    def _extract_live_room_from_html(html: str) -> Optional[Dict[str, Any]]:
+        pattern = r"<script[^>]*>\s*(self\.__pace_f\.push\(.*?\))\s*</script>"
+        for call in re.findall(pattern, html, flags=re.DOTALL):
+            try:
+                args = json.loads(call[len("self.__pace_f.push(") : -1])
+                flight = args[1] if isinstance(args, list) and len(args) > 1 else None
+                if not isinstance(flight, str) or not flight.startswith("c:"):
+                    continue
+                room = DouyinAPIClient._find_stream_room(json.loads(flight[2:]))
+            except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if room:
+                user = room.get("owner") if isinstance(room.get("owner"), dict) else {}
+                return {"room": room, "user": user, "raw": {"source": "live_page_ssr"}}
+        return None
+
+    async def _fetch_live_room_from_page(self, web_rid: str) -> Optional[Dict[str, Any]]:
+        await self._ensure_session()
+        url = f"{self.LIVE_WEB_BASE_URL}/{web_rid}"
+        headers = {**self.headers, "Referer": "https://live.douyin.com/"}
+        try:
+            async with self._session.get(
+                url, headers=headers, proxy=self.proxy or None
+            ) as response:
+                if response.status != 200:
+                    logger.error(
+                        "Live page request failed: web_rid=%s, status=%s", web_rid, response.status
+                    )
+                    return None
+                return self._extract_live_room_from_html(await response.text())
+        except Exception as exc:
+            logger.error("Live page fallback failed: web_rid=%s, error=%s", web_rid, exc)
+            return None
+
+    async def get_live_room_info(
+        self,
+        room_id: str,
+        *,
+        sec_user_id: str = "",
+        room_id_kind: str = "web_rid",
+    ) -> Optional[Dict[str, Any]]:
+        """按网页直播号或内部 room ID 拉取统一的直播间信息。"""
+        path, params, base_url = await self._build_live_room_request(
+            room_id, sec_user_id, room_id_kind
+        )
+
+        raw = await self._request_json(
+            path,
+            params,
+            suppress_error=room_id_kind != "room_id",
+            max_retries=1 if room_id_kind != "room_id" else 3,
+            base_url=base_url,
+            request_headers={
+                "Referer": "https://live.douyin.com/",
+                "Origin": "https://live.douyin.com",
+            },
+        )
+        info = self._normalize_live_room_response(raw) if raw else None
+        if info or room_id_kind == "room_id":
+            return info
+        logger.info("Live API unavailable for web_rid=%s; trying page SSR", room_id)
+        return await self._fetch_live_room_from_page(room_id)
+
+    async def get_live_replay_episode(self, episode_id: str) -> Optional[Dict[str, Any]]:
+        """获取直播回放入口信息，包含回放对应的 room_id。"""
+        params = await self._default_query()
+        params.update({"channel": "", "episode_id": episode_id})
+        raw = await self._request_json(
+            "/aweme/v1/web/show/episode/enter/",
+            params,
+            suppress_error=True,
+        )
+        data = raw.get("data") if isinstance(raw, dict) else None
+        if isinstance(data, dict):
+            for key in ("episode", "episode_info", "show_episode"):
+                episode = data.get(key)
+                if isinstance(episode, dict):
+                    return episode
+        episode = raw.get("episode") if isinstance(raw, dict) else None
+        return episode if isinstance(episode, dict) else None
+
+    async def get_live_replay_info(
+        self, episode_id: str, room_id: str, replay_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """获取直播回放条目，包含可播放的 video/audio URL 列表。"""
+        params = await self._default_query()
+        params.update({"channel": "", "episode_id": episode_id, "room_id": room_id})
+        if replay_id:
+            params["replay_id"] = replay_id
+        raw = await self._request_json(
+            "/aweme/v1/web/show/episode/replay_list/",
+            params,
+            suppress_error=True,
+        )
+        data = raw.get("data") if isinstance(raw, dict) else None
+        candidates = self._live_replay_candidates(data)
+        if not candidates:
+            return None
+
+        for item in candidates:
+            if self._live_replay_matches(item, episode_id, replay_id):
+                return item
+
+        if replay_id:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    @staticmethod
+    def _live_replay_candidates(data: Any) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+
+        def add_item(item: Any) -> None:
+            if isinstance(item, dict):
+                candidates.append(item)
+
+        def add_list(items: Any) -> None:
+            if isinstance(items, list):
+                for item in items:
+                    add_item(item)
+
+        if not isinstance(data, dict):
+            return candidates
+        for key in ("replay", "replay_info", "current_replay"):
+            add_item(data.get(key))
+        for key in ("info_list", "replay_list", "replays"):
+            add_list(data.get(key))
+        groups = data.get("all_replay")
+        if isinstance(groups, list):
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                for key in ("info_list", "replay_list", "replays"):
+                    add_list(group.get(key))
+        if "video_info" in data:
+            add_item(data)
+        return candidates
+
+    @staticmethod
+    def _live_replay_matches(
+        item: Dict[str, Any], episode_id: str, replay_id: Optional[str] = None
+    ) -> bool:
+        replay_keys = ("replay_id", "id", "replay_id_str")
+        episode_keys = ("episode_id_str", "episode_id")
+        if replay_id:
+            return any(str(item.get(key) or "") == str(replay_id) for key in replay_keys)
+        return any(str(item.get(key) or "") == str(episode_id) for key in episode_keys)
+
+    async def get_hot_search_board(self) -> Dict[str, Any]:
+        """获取抖音热搜榜。返回归一化 dict，items 为热搜词条列表。"""
+        params = await self._default_query()
+        params.update({"detail_list": "1", "source": "6"})
+        raw = await self._request_json(
+            "/aweme/v1/web/hot/search/list/", params, suppress_error=True
+        )
+        # 热榜返回结构中数据在 data.word_list 或 word_list
+        data_root = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+        word_list = data_root.get("word_list") if isinstance(data_root, dict) else None
+        status_code = int(raw.get("status_code") or 0)
+        items = word_list if isinstance(word_list, list) else []
+        # 响应为空 + 非正常状态码时显式告警，方便排查 cookie 失效/签名失败
+        if not items and (status_code or not raw):
+            logger.warning(
+                "Hot search board returned no items (status_code=%s). "
+                "Check cookies / signature; Douyin may be rejecting the request.",
+                status_code,
+            )
+        return {
+            "items": items,
+            "has_more": False,
+            "max_cursor": 0,
+            "status_code": status_code,
+            "raw": raw,
+        }
+
+    async def search_aweme(
+        self,
+        keyword: str,
+        *,
+        offset: int = 0,
+        count: int = 10,
+        sort_type: int = 0,
+        publish_time: int = 0,
+    ) -> Dict[str, Any]:
+        """搜索作品。
+
+        Args:
+            sort_type: 0 综合 / 1 最多点赞 / 2 最新发布
+            publish_time: 0 不限 / 1 一天内 / 7 一周内 / 182 半年内
+        """
+        params = await self._default_query()
+        params.update(
+            {
+                "keyword": keyword,
+                "search_channel": "aweme_video_web",
+                "sort_type": sort_type,
+                "publish_time": publish_time,
+                "search_source": "normal_search",
+                "query_correct_type": "1",
+                "is_filter_search": 1 if (sort_type or publish_time) else 0,
+                "offset": offset,
+                "count": count,
+            }
+        )
+        raw = await self._request_json(
+            "/aweme/v1/web/general/search/single/", params, suppress_error=True
+        )
+        # 搜索结果每条在 data[].aweme_info；需要拍平
+        data_list = raw.get("data") if isinstance(raw.get("data"), list) else []
+        items: List[Dict[str, Any]] = []
+        for entry in data_list:
+            if not isinstance(entry, dict):
+                continue
+            aweme_info = entry.get("aweme_info")
+            if isinstance(aweme_info, dict):
+                items.append(aweme_info)
+
+        has_more_value = raw.get("has_more", 0)
+        try:
+            has_more = bool(int(has_more_value))
+        except (TypeError, ValueError):
+            has_more = bool(has_more_value)
+
+        cursor_value = raw.get("cursor") or raw.get("offset") or 0
+        try:
+            next_offset = int(cursor_value)
+        except (TypeError, ValueError):
+            next_offset = 0
+
+        status_code = int(raw.get("status_code") or 0)
+        if not items and (status_code or not raw):
+            logger.warning(
+                "Search returned no items for keyword=%r (status_code=%s, offset=%s). "
+                "Possible causes: cookies expired, signature rejected, or query blocked.",
+                keyword,
+                status_code,
+                offset,
+            )
+
+        return {
+            "items": items,
+            "has_more": has_more,
+            "max_cursor": next_offset,
+            "status_code": status_code,
+            "raw": raw,
+        }
+
+    async def get_aweme_comments(
+        self,
+        aweme_id: str,
+        *,
+        cursor: int = 0,
+        count: int = 20,
+        include_replies: bool = False,
+    ) -> Dict[str, Any]:
+        """获取作品评论列表（一页）。
+
+        Args:
+            aweme_id: 作品 ID
+            cursor: 分页游标（首次传 0）
+            count: 每页数量（抖音上限一般为 20）
+            include_replies: 是否拉取每条评论的二级回复（额外请求）
+        Returns:
+            归一化后的分页响应 dict，items 为评论列表。
+        """
+        params = await self._default_query()
+        params.update(
+            {
+                "aweme_id": aweme_id,
+                "cursor": cursor,
+                "count": count,
+                "item_type": "0",
+                "insert_ids": "",
+                "whale_cut_token": "",
+                "cut_version": "1",
+                "rcFT": "",
+            }
+        )
+        raw = await self._request_json("/aweme/v1/web/comment/list/", params)
+        normalized = self._normalize_paged_response(raw, item_keys=["comments"])
+
+        if include_replies:
+            comments = normalized.get("items") or []
+            for comment in comments:
+                if not isinstance(comment, dict):
+                    continue
+                comment_id = comment.get("cid") or comment.get("comment_id")
+                if not comment_id or int(comment.get("reply_comment_total") or 0) <= 0:
+                    continue
+                try:
+                    reply_page = await self.get_aweme_comment_replies(
+                        aweme_id=aweme_id, comment_id=str(comment_id), count=count
+                    )
+                    comment["_replies"] = reply_page.get("items") or []
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Fetch reply for comment %s failed: %s", comment_id, exc)
+        return normalized
+
+    async def get_aweme_comment_replies(
+        self,
+        *,
+        aweme_id: str,
+        comment_id: str,
+        cursor: int = 0,
+        count: int = 20,
+    ) -> Dict[str, Any]:
+        """获取某条评论的二级回复列表。"""
+        params = await self._default_query()
+        params.update(
+            {
+                "item_id": aweme_id,
+                "comment_id": comment_id,
+                "cursor": cursor,
+                "count": count,
+            }
+        )
+        raw = await self._request_json("/aweme/v1/web/comment/list/reply/", params)
+        return self._normalize_paged_response(raw, item_keys=["comments"])
+
+    async def resolve_short_url(
+        self, short_url: str, *, timeout_seconds: float = 10.0
+    ) -> Optional[str]:
+        """跟随短链 302，返回最终 URL。失败时返回 None。
+
+        单独设置较短超时（默认 10s），避免被目标站挂死后拖慢整轮下载。
+        HTTP 状态码 ≥ 400 时视为解析失败，返回 None 以避免把错误页 URL
+        继续喂给下游 parser，从而在下游触发更隐晦的 "Unsupported URL" 噪声。
+        """
+        try:
+            await self._ensure_session()
+            async with self._session.get(
+                short_url,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                proxy=self.proxy or None,
+            ) as response:
+                final_url = str(response.url)
+                if response.status >= 400:
+                    logger.warning(
+                        "Short URL resolved with HTTP %s (treated as failure): %s -> %s",
+                        response.status,
+                        safe_log_url(short_url),
+                        safe_log_url(final_url),
+                    )
+                    return None
+                return final_url
+        except asyncio.TimeoutError:
+            logger.error(
+                "Timeout resolving short URL after %.1fs: %s",
+                timeout_seconds,
+                safe_log_url(short_url),
+            )
+            return None
+        except Exception as e:
+            logger.error("Failed to resolve short URL: %s, error: %s", safe_log_url(short_url), e)
+            return None
+
+    async def save_user_homepage_screenshot(
+        self,
+        sec_uid: str,
+        save_path: Path,
+        *,
+        profile: Optional[Dict[str, Any]] = None,
+        viewport_width: int = 1600,
+        viewport_height: int = 900,
+        timeout_seconds: int = 30,
+    ) -> bool:
+        """Save one creator-homepage viewport without affecting downloads."""
+        if os.environ.get(_HOMEPAGE_SCREENSHOT_BRIDGE_ENV) == "electron":
+            return self._emit_homepage_screenshot_request(sec_uid, save_path, profile)
+
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("Playwright not available, homepage screenshot skipped: %s", exc)
+            return False
+
+        target = Path(save_path)
+        tmp_path = target.with_name(f".{target.name}.tmp")
+        target_url = f"{self.BASE_URL}/user/{sec_uid}"
+        timeout_ms = max(5, int(timeout_seconds)) * 1000
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            async with async_playwright() as playwright:
+                launch_options: Dict[str, Any] = {
+                    "headless": True,
+                    "args": [
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                    ],
+                }
+                proxy = str(self.proxy or "").strip()
+                if proxy:
+                    if proxy.startswith("socks5h://"):
+                        proxy = "socks5://" + proxy[len("socks5h://") :]
+                    launch_options["proxy"] = {"server": proxy}
+
+                browser = await playwright.chromium.launch(**launch_options)
+                try:
+                    context = await browser.new_context(
+                        user_agent=self.headers.get("User-Agent", ""),
+                        locale="zh-CN",
+                        viewport={"width": viewport_width, "height": viewport_height},
+                    )
+                    try:
+                        cookies = self._browser_cookie_payload()
+                        if cookies:
+                            await context.add_cookies(cookies)
+                        page = await context.new_page()
+                        await page.goto(
+                            target_url,
+                            wait_until="domcontentloaded",
+                            timeout=timeout_ms,
+                        )
+                        title = await page.title()
+                        if "验证码" in title:
+                            logger.warning(
+                                "Homepage screenshot skipped because verification is required"
+                            )
+                            return False
+                        profile_expectation: Dict[str, str] = {}
+                        if isinstance(profile, dict):
+                            nickname = profile.get("nickname")
+                            if isinstance(nickname, str) and nickname.strip():
+                                profile_expectation["nickname"] = nickname.strip()[:200]
+                        try:
+                            await page.wait_for_function(
+                                _HOMEPAGE_PROFILE_READY_SCRIPT,
+                                arg=profile_expectation,
+                                polling=250,
+                                timeout=_HOMEPAGE_PROFILE_READY_TIMEOUT_MS,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Homepage profile data did not become ready before capture: %s",
+                                _safe_error_text(exc),
+                            )
+                        try:
+                            blocked_reason = await page.evaluate(_HOMEPAGE_PROFILE_BLOCKED_SCRIPT)
+                        except Exception:
+                            blocked_reason = ""
+                        if blocked_reason:
+                            logger.warning(
+                                "Homepage screenshot skipped because the page is blocked: %s",
+                                blocked_reason,
+                            )
+                            return False
+                        await page.screenshot(path=str(tmp_path), type="png", full_page=False)
+                        await asyncio.to_thread(os.replace, tmp_path, target)
+                    finally:
+                        await context.close()
+                finally:
+                    await browser.close()
+        except Exception as exc:
+            logger.warning(
+                "Failed to save homepage screenshot for %s: %s",
+                sec_uid,
+                _safe_error_text(exc),
+            )
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
+        logger.info("Homepage screenshot saved: %s", target)
+        return True
+
+    @staticmethod
+    def _emit_homepage_screenshot_request(
+        sec_uid: str,
+        save_path: Path,
+        profile: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        try:
+            safe_profile: Dict[str, Any] = {}
+            if isinstance(profile, dict):
+                nickname = profile.get("nickname")
+                if isinstance(nickname, str) and nickname.strip():
+                    safe_profile["nickname"] = nickname.strip()[:200]
+                for key in ("follower_count", "following_count", "total_favorited"):
+                    count = profile.get(key)
+                    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                        safe_profile[key] = count
+
+            request = {"version": 1, "sec_uid": str(sec_uid), "save_path": str(save_path)}
+            if safe_profile:
+                request["profile"] = safe_profile
+            payload = json.dumps(
+                request,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+            sys.stdout.write(f"{_HOMEPAGE_SCREENSHOT_MESSAGE_PREFIX}{encoded}\n")
+            sys.stdout.flush()
+            return True
+        except Exception as exc:
+            logger.warning("Failed to request Electron homepage screenshot: %s", exc)
+            return False
+
+    async def collect_user_post_ids_via_browser(
+        self,
+        sec_uid: str,
+        *,
+        expected_count: int = 0,
+        headless: bool = False,
+        max_scrolls: int = 240,
+        idle_rounds: int = 8,
+        wait_timeout_seconds: int = 600,
+    ) -> List[str]:
+        browser_started = time.monotonic()
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("Playwright not available, browser fallback disabled: %s", exc)
+            return []
+
+        target_url = f"{self.BASE_URL}/user/{sec_uid}"
+        timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
+        ids: List[str] = []
+        seen: set[str] = set()
+        post_api_ids: List[str] = []
+        post_api_seen: set[str] = set()
+        post_api_aweme_items: Dict[str, Dict[str, Any]] = {}
+        post_api_page_hits = 0
+        self._browser_post_aweme_items = {}
+        self._browser_post_stats = {}
+
+        def _merge(new_ids: List[str]):
+            for aweme_id in new_ids:
+                if aweme_id and aweme_id not in seen:
+                    seen.add(aweme_id)
+                    ids.append(aweme_id)
+
+        logger.warning(
+            "API翻页受限，启动浏览器兜底采集：target=%s expected_count=%s "
+            "headless=%s max_scrolls=%s idle_rounds=%s timeout_s=%s",
+            safe_log_url(target_url),
+            expected_count,
+            headless,
+            max_scrolls,
+            idle_rounds,
+            wait_timeout_seconds,
+        )
+
+        async with async_playwright() as playwright:
+            executable_path = str(getattr(playwright.chromium, "executable_path", "") or "")
+            logger.info(
+                "Browser fallback runtime: executable=%s exists=%s",
+                executable_path or "-",
+                bool(executable_path and os.path.exists(executable_path)),
+            )
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent=self.headers.get("User-Agent", ""),
+                locale="zh-CN",
+                viewport={"width": 1600, "height": 900},
+            )
+            cookies = self._browser_cookie_payload()
+            logger.info(
+                "Browser fallback context ready: cookie_count=%s cookie_names=%s",
+                len(cookies),
+                ",".join(sorted(str(cookie.get("name")) for cookie in cookies)) or "-",
+            )
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
+            pending_response_tasks: List[asyncio.Task] = []
+
+            async def _handle_response(response):
+                nonlocal post_api_page_hits
+                url = response.url or ""
+                if "/aweme/v1/web/aweme/post/" not in url:
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    return
+                aweme_items = data.get("aweme_list") if isinstance(data, dict) else None
+                if isinstance(aweme_items, list):
+                    post_api_page_hits += 1
+                    extracted: List[str] = []
+                    for item in aweme_items:
+                        if not isinstance(item, dict):
+                            continue
+                        aweme_id = item.get("aweme_id")
+                        if not aweme_id:
+                            continue
+                        aweme_id_str = str(aweme_id)
+                        extracted.append(aweme_id_str)
+                        if aweme_id_str not in post_api_aweme_items:
+                            post_api_aweme_items[aweme_id_str] = item
+                    _merge(extracted)
+                    for aweme_id in extracted:
+                        if aweme_id not in post_api_seen:
+                            post_api_seen.add(aweme_id)
+                            post_api_ids.append(aweme_id)
+
+            def _on_response(response):
+                pending_response_tasks.append(asyncio.create_task(_handle_response(response)))
+
+            page.on("response", _on_response)
+
+            try:
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:
+                    logger.warning(
+                        "Browser goto timeout or error, continue with current page state: %s",
+                        exc,
+                    )
+
+                title = ""
+                try:
+                    title = await page.title()
+                except Exception:
+                    pass
+                logger.info(
+                    "Browser fallback page state: title=%r url=%s",
+                    title[:200],
+                    safe_log_url(getattr(page, "url", target_url)),
+                )
+                if "验证码" in title:
+                    if headless:
+                        logger.warning(
+                            "检测到验证码页面且当前为 headless 模式，无法人工验证。"
+                            "请将 browser_fallback.headless 设为 false。"
+                        )
+                        return []
+                    logger.warning("检测到验证码页面，请在浏览器中完成验证，程序会自动继续采集。")
+                    await self._wait_for_manual_verification(
+                        page, wait_timeout_seconds=wait_timeout_seconds
+                    )
+                    if not page.is_closed():
+                        try:
+                            await page.goto(
+                                target_url,
+                                wait_until="domcontentloaded",
+                                timeout=timeout_ms,
+                            )
+                        except Exception as exc:
+                            logger.warning("Reload user page after verification failed: %s", exc)
+
+                try:
+                    warmup_seconds = min(20, max(3, int(wait_timeout_seconds)))
+                    for _ in range(warmup_seconds):
+                        if page.is_closed():
+                            logger.warning("Browser page closed during warmup")
+                            break
+                        _merge(await self._extract_aweme_ids_from_page(page))
+                        if ids:
+                            break
+                        await page.wait_for_timeout(1000)
+
+                    stable_rounds = 0
+                    max_scroll_rounds = max(1, int(max_scrolls))
+                    idle_stop_rounds = max(1, int(idle_rounds))
+
+                    for _ in range(max_scroll_rounds):
+                        if page.is_closed():
+                            logger.warning("Browser page closed during scrolling")
+                            break
+                        await page.mouse.wheel(0, 3800)
+                        await page.wait_for_timeout(1200)
+
+                        before = len(ids)
+                        _merge(await self._extract_aweme_ids_from_page(page))
+                        if len(ids) == before:
+                            stable_rounds += 1
+                        else:
+                            stable_rounds = 0
+
+                        if expected_count > 0 and len(ids) >= expected_count:
+                            break
+                        if expected_count <= 0 and stable_rounds >= idle_stop_rounds:
+                            break
+                except Exception as exc:
+                    logger.warning(
+                        "Browser collection interrupted, use collected ids so far: %s",
+                        exc,
+                    )
+            finally:
+                if pending_response_tasks:
+                    await asyncio.gather(*pending_response_tasks, return_exceptions=True)
+                try:
+                    browser_cookies = await context.cookies(self.BASE_URL)
+                    self._sync_browser_cookies(browser_cookies)
+                except Exception as exc:
+                    logger.debug("Sync browser cookies skipped: %s", exc)
+                await context.close()
+                await browser.close()
+
+        selected_ids: List[str] = []
+        selected_seen: set[str] = set()
+        for aweme_id in post_api_ids + ids:
+            if aweme_id and aweme_id not in selected_seen:
+                selected_seen.add(aweme_id)
+                selected_ids.append(aweme_id)
+        self._browser_post_aweme_items = post_api_aweme_items
+        self._browser_post_stats = {
+            "merged_ids": len(ids),
+            "post_api_ids": len(post_api_ids),
+            "selected_ids": len(selected_ids),
+            "post_items": len(post_api_aweme_items),
+            "post_pages": post_api_page_hits,
+        }
+        logger.warning(
+            "浏览器兜底采集 aweme_id: duration_ms=%s merged=%s from_post_api=%s "
+            "selected=%s post_items=%s post_pages=%s",
+            _elapsed_ms(browser_started),
+            len(ids),
+            len(post_api_ids),
+            len(selected_ids),
+            len(post_api_aweme_items),
+            post_api_page_hits,
+        )
+        return selected_ids
+
+    def pop_browser_post_aweme_items(self) -> Dict[str, Dict[str, Any]]:
+        items = self._browser_post_aweme_items
+        self._browser_post_aweme_items = {}
+        return items
+
+    def pop_browser_post_stats(self) -> Dict[str, int]:
+        stats = self._browser_post_stats
+        self._browser_post_stats = {}
+        return stats
+
+    def _browser_cookie_payload(self) -> List[Dict[str, str]]:
+        payload: List[Dict[str, str]] = []
+        for name, value in self.cookies.items():
+            if not name:
+                continue
+            if name in self._BROWSER_COOKIE_BLOCKLIST:
+                continue
+            payload.append(
+                {
+                    "name": str(name),
+                    "value": str(value or ""),
+                    "url": f"{self.BASE_URL}/",
+                }
+            )
+        return payload
+
+    async def _extract_aweme_ids_from_page(self, page) -> List[str]:
+        script = """
+() => {
+  const result = [];
+  const seen = new Set();
+  const push = (id) => {
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    result.push(id);
+  };
+
+  const collectFrom = (text, pattern) => {
+    if (!text) return;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      push(match[1]);
+    }
+  };
+
+  const links = document.querySelectorAll("a[href]");
+  for (const node of links) {
+    const href = node.getAttribute("href") || "";
+    collectFrom(href, /\\/video\\/(\\d{15,20})/g);
+    collectFrom(href, /\\/note\\/(\\d{15,20})/g);
+  }
+
+  const html = document.documentElement ? document.documentElement.innerHTML : "";
+  collectFrom(html, /"aweme_id":"(\\d{15,20})"/g);
+  collectFrom(html, /"group_id":"(\\d{15,20})"/g);
+
+  return result;
+}
+"""
+        try:
+            data = await page.evaluate(script)
+            if isinstance(data, list):
+                return [str(x) for x in data if x]
+        except Exception as exc:
+            logger.debug("Extract aweme_id from page failed: %s", exc)
+        return []
+
+    async def _wait_for_manual_verification(self, page, *, wait_timeout_seconds: int) -> None:
+        deadline = asyncio.get_running_loop().time() + max(30, int(wait_timeout_seconds))
+        while asyncio.get_running_loop().time() < deadline:
+            if page.is_closed():
+                logger.warning("Browser page closed while waiting manual verification")
+                return
+            title = ""
+            try:
+                title = await page.title()
+            except Exception:
+                pass
+            if "验证码" not in title:
+                logger.warning("验证码页面已退出，继续采集。")
+                return
+            await page.wait_for_timeout(1000)
+
+        logger.warning("等待手动验证超时（%ss），继续按当前页面状态采集。", wait_timeout_seconds)
+
+    def _sync_browser_cookies(self, browser_cookies: List[Dict[str, Any]]) -> None:
+        merged: Dict[str, str] = {}
+        for cookie in browser_cookies or []:
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "").strip()
+            domain = str(cookie.get("domain") or "")
+            if not name or not value:
+                continue
+            if "douyin.com" not in domain:
+                continue
+            merged[name] = value
+
+        if not merged:
+            return
+
+        self.cookies.update(merged)
+        if self._session and not self._session.closed:
+            self._session.cookie_jar.update_cookies(merged)
+        logger.warning("Synced %s browser cookie(s) back to API client", len(merged))
