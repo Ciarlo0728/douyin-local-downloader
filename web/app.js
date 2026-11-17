@@ -52,14 +52,15 @@ function renderGrid(){
 }
 function renderScan(){
   if(!scan)return;
-  $('result-title').textContent=scan.items?.[0]?.author||'作品列表';
+  $('result-title').textContent=scan.type==='search'?`搜索：${scan.keyword}`:(scan.items?.[0]?.author||'作品列表');
   $('result-count').textContent=`已发现 ${scan.items?.length||0} 条 · 当前显示 ${visibleItems().length} 条`;
   $('library-count').textContent=scan.items?.length||0;
   $('scan-status').hidden=false;$('scan-status-text').textContent=scan.message;
   $('scan-status').classList.toggle('warning',scan.status==='restricted');
   const busy=['running','queued'].includes(scan.status);
-  $('stop-scan').hidden=!busy;$('load-more').hidden=busy||scan.type!=='user'||scan.status==='complete';
-  $('scan-submit').disabled=busy;$('scan-submit').textContent=busy?'扫描中…':'扫描作品 →';
+  $('stop-scan').hidden=!busy;$('load-more').hidden=busy||!['user','search'].includes(scan.type)||scan.status==='complete';
+  $('load-more').textContent=scan.type==='search'?'继续加载 50 条搜索结果 →':'继续加载 50 条 →';
+  $('scan-submit').disabled=busy;$('search-submit').disabled=busy;$('scan-submit').textContent=busy?'扫描中…':'扫描作品 →';$('search-submit').textContent=busy?'搜索中…':'搜索作品 →';
   renderGrid();
 }
 function renderJobs(){
@@ -80,7 +81,8 @@ function renderJobs(){
     $('jobs').append(row);
   });
 }
-async function setScan(id){currentScan=id;localStorage.setItem('douyin-scan',id);selected.clear();lastGrid='';scan=await api('scans/'+id);$('url').value=scan.url;renderScan();}
+async function setScan(id){currentScan=id;localStorage.setItem('douyin-scan',id);selected.clear();lastGrid='';scan=await api('scans/'+id);if(scan.type==='search'){$('search-query').value=scan.keyword||'';showSource('search');}else{$('url').value=scan.url;showSource('link');}renderScan();}
+function showSource(mode){const search=mode==='search';$('scan-form').hidden=search;$('search-form').hidden=!search;$('link-tab').classList.toggle('active',!search);$('search-tab').classList.toggle('active',search);}
 async function poll(){
   if(pollBusy)return;pollBusy=true;
   try{
@@ -96,6 +98,8 @@ async function poll(){
   finally{pollBusy=false;}
 }
 $('scan-form').onsubmit=async e=>{e.preventDefault();$('scan-submit').disabled=true;try{const s=await api('scan',{url:$('url').value,count:Number($('scan-count').value)});await setScan(s.id);}catch(error){toast(error.message);}finally{$('scan-submit').disabled=false;}};
+$('search-form').onsubmit=async e=>{e.preventDefault();$('search-submit').disabled=true;try{const s=await api('search',{keyword:$('search-query').value,count:50,sort_type:Number($('search-sort').value),publish_time:Number($('search-time').value)});await setScan(s.id);}catch(error){toast(error.message);}finally{$('search-submit').disabled=false;}};
+$('link-tab').onclick=()=>showSource('link');$('search-tab').onclick=()=>showSource('search');
 $('login').onclick=async()=>{try{await api('login',{});toast('请在打开的 Edge 窗口完成登录，然后回来扫描。');await poll();}catch(e){toast(e.message);}};
 $('load-more').onclick=async()=>{try{await api('scans/'+currentScan+'/more',{});await poll();}catch(e){toast(e.message);}};
 $('stop-scan').onclick=async()=>{try{await api('scans/'+currentScan+'/stop',{});await poll();}catch(e){toast(e.message);}};

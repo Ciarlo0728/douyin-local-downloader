@@ -168,6 +168,52 @@ async def test_scan_failure_preserves_discovered_items(client, monkeypatch):
     assert result["message"] == "需要重新登录"
 
 
+async def test_keyword_search_saves_results_and_supports_more(client, monkeypatch):
+    fake_browser = AsyncMock()
+    fake_browser.cookies.return_value = {"sessionid": "local-test-session"}
+    monkeypatch.setattr(local, "browser", fake_browser)
+
+    class FakeClient:
+        def __init__(self, cookies):
+            assert cookies["sessionid"] == "local-test-session"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def search_aweme(self, keyword, **kwargs):
+            assert keyword == "露营"
+            start = kwargs["offset"]
+            return {
+                "items": [item(str(1234567890123456 + start))],
+                "has_more": start == 0,
+                "max_cursor": start + 10,
+            }
+
+    monkeypatch.setattr(local, "DouyinAPIClient", FakeClient)
+    response = await client.post(
+        "/api/search",
+        json={"keyword": " 露营 ", "count": 1, "sort_type": 2, "publish_time": 7},
+    )
+    assert response.status_code == 200
+    scan_id = response.json()["id"]
+    await asyncio.gather(*list(local.tasks.values()))
+    result = (await client.get(f"/api/scans/{scan_id}")).json()
+    assert result["type"] == "search"
+    assert result["keyword"] == "露营"
+    assert len(result["items"]) == 1
+    assert result["status"] == "limited"
+
+
+async def test_keyword_search_requires_valid_filters(client):
+    response = await client.post(
+        "/api/search", json={"keyword": "测试", "count": 50, "sort_type": 0, "publish_time": 99}
+    )
+    assert response.status_code == 400
+
+
 async def test_retry_only_failed_or_cancelled(client, monkeypatch):
     local.save("job", {"id": "finished", "status": "success"})
     assert (await client.post("/api/jobs/finished/retry", json={})).status_code == 400

@@ -137,6 +137,58 @@ async def scan_worker(scan):
         save("scan", scan)
 
 
+async def search_worker(scan):
+    try:
+        async with scan_lock:
+            scan.update(status="running", message=f"正在搜索“{scan['keyword']}”…")
+            save("scan", scan)
+            cookies = await browser.cookies()
+            if not cookies.get("sessionid") and not cookies.get("sessionid_ss"):
+                raise RuntimeError("关键词搜索需要先登录抖音")
+            ids = list(scan.get("ids", []))
+            seen = set(ids)
+            offset = int(scan.get("offset", 0))
+            has_more = True
+            async with DouyinAPIClient(cookies) as client:
+                while len(ids) < scan["target"] and has_more:
+                    page = await client.search_aweme(
+                        scan["keyword"], offset=offset,
+                        count=min(20, scan["target"] - len(ids)),
+                        sort_type=scan["sort_type"], publish_time=scan["publish_time"],
+                    )
+                    if page.get("status_code"):
+                        raise RuntimeError("搜索请求被抖音限制，请在登录窗口完成验证后重试")
+                    items = [x for x in page.get("items", []) if isinstance(x, dict) and x.get("aweme_id")]
+                    store.save_items(items)
+                    for item in items:
+                        item_id = str(item["aweme_id"])
+                        if item_id not in seen:
+                            seen.add(item_id)
+                            ids.append(item_id)
+                    next_offset = int(page.get("max_cursor") or 0)
+                    has_more = bool(page.get("has_more")) and next_offset != offset
+                    offset = next_offset
+                    scan.update(ids=ids, offset=offset, has_more=has_more, message=f"已找到 {len(ids)} 条作品…")
+                    save("scan", scan)
+                    if not items:
+                        break
+                    await asyncio.sleep(0.2)
+            message = f"搜索完成，共找到 {len(ids)} 条作品"
+            if not ids:
+                message = "没有找到作品；可调整关键词、排序或时间范围后重试"
+            elif has_more:
+                message += "，可继续加载"
+            scan.update(status="limited" if has_more else "complete", message=message, ids=ids, offset=offset, has_more=has_more)
+            save("scan", scan)
+    except asyncio.CancelledError:
+        scan.update(status="stopped", message="已停止搜索，保留已发现作品")
+        save("scan", scan)
+        raise
+    except Exception as exc:
+        scan.update(status="restricted", message=public_error(exc))
+        save("scan", scan)
+
+
 class Reporter:
     def __init__(self, job):
         self.job = job
@@ -309,7 +361,7 @@ app.mount("/static", StaticFiles(directory=ROOT / "web"), name="static")
 
 @app.get("/api/health")
 async def health():
-    return {"app": "douyin-local", "status": "ok", "version": "0.1.0"}
+    return {"app": "douyin-local", "status": "ok", "version": "0.2.0"}
 
 
 @app.get("/api/state")
@@ -345,6 +397,13 @@ class ScanRequest(BaseModel):
     count: int = Field(default=50, ge=1, le=500)
 
 
+class SearchRequest(BaseModel):
+    keyword: str = Field(min_length=1, max_length=100)
+    count: int = Field(default=50, ge=1, le=200)
+    sort_type: int = Field(default=0, ge=0, le=2)
+    publish_time: int = Field(default=0)
+
+
 @app.post("/api/scan")
 async def scan_start(req: ScanRequest):
     if any(key.startswith("scan:") for key in tasks):
@@ -368,13 +427,34 @@ async def scan_start(req: ScanRequest):
     return scan
 
 
+@app.post("/api/search")
+async def search_start(req: SearchRequest):
+    if any(key.startswith("scan:") for key in tasks):
+        raise HTTPException(409, "已有扫描或搜索正在进行，请等待完成或停止后再开始")
+    keyword = req.keyword.strip()
+    if not keyword:
+        raise HTTPException(400, "请输入搜索关键词")
+    if req.publish_time not in {0, 1, 7, 182}:
+        raise HTTPException(400, "发布时间筛选无效")
+    scan = {
+        "id": uuid.uuid4().hex, "type": "search", "url": "搜索：" + keyword,
+        "keyword": keyword, "sort_type": req.sort_type, "publish_time": req.publish_time,
+        "target": req.count, "offset": 0, "has_more": True, "ids": [],
+        "status": "queued", "message": "等待搜索", "created": time.time(),
+    }
+    save("scan", scan)
+    spawn("scan:" + scan["id"], search_worker(scan))
+    return scan
+
+
 @app.get("/api/scans/{scan_id}")
 async def get_scan(scan_id: str):
     scan = store.get("scan", scan_id)
     if not scan:
         raise HTTPException(404, "扫描记录不存在")
     items = [store.view(item_id, settings["output"]) for item_id in scan.get("ids", [])]
-    scan["items"] = sorted([x for x in items if x], key=lambda x: x["published"], reverse=True)
+    items = [x for x in items if x]
+    scan["items"] = items if scan.get("type") == "search" else sorted(items, key=lambda x: x["published"], reverse=True)
     return scan
 
 
@@ -383,11 +463,12 @@ async def scan_more(scan_id: str):
     if any(key.startswith("scan:") for key in tasks):
         raise HTTPException(409, "扫描仍在进行中")
     scan = store.get("scan", scan_id)
-    if not scan or scan.get("type") != "user":
-        raise HTTPException(400, "仅主页扫描可以继续加载")
+    if not scan or scan.get("type") not in {"user", "search"}:
+        raise HTTPException(400, "当前结果不能继续加载")
     scan.update(target=len(scan.get("ids", [])) + 50, status="queued", message="等待继续加载")
     save("scan", scan)
-    spawn("scan:" + scan_id, scan_worker(scan))
+    worker = search_worker(scan) if scan.get("type") == "search" else scan_worker(scan)
+    spawn("scan:" + scan_id, worker)
     return scan
 
 
